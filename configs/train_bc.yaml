@@ -1,0 +1,20 @@
+# train_bc.yaml (owner: Person 2). Loaded into a dataclass; no magic numbers in code.
+maps_dir: data/maps/training/normalized  # make training-maps; includes the demo songs, charts only
+split: train
+min_gap_sec: 0.0          # curriculum: thin same-color notes closer than this
+window_sec: 10.0          # episode length; a random window of a random map
+batch_size: 64            # envs per update
+learning_rate: 0.001
+n_updates: 500           # starts from a fitted readout (src/training/calibration.py), so fewer needed
+log_every: 50             # also runs a greedy evaluation rollout
+seed: 0
+variant: real              # label for checkpoints/{variant}/seed{seed}/
+checkpoint_dir: checkpoints
+brain_learning_rate: 0.00001  # Person 1: brain trains slowly; live baseline (model.yaml) keeps drift off the readout
+# Stages in order (spec 7.2). fraction: share of n_updates. difficulty_quantile: maps up to
+# that quantile of the split's difficulty score. speed_scale multiplies saber.yaml
+# note_speed_mps. dagger_fraction: share of envs the policy drives. curriculum=none turns it off.
+curriculum:
+  - {fraction: 0.3, score_direction: false, difficulty_quantile: 0.3, speed_scale: 0.75}
+  - {fraction: 0.3, score_direction: true, difficulty_quantile: 0.3, speed_scale: 0.75, dagger_fraction: 0.25}
+  - {fraction: 0.4, score_direction: true, difficulty_quantile: 1.0, dagger_fraction: 0.5}

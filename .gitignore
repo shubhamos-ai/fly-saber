@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+test-results/
+
+# Data and outputs (large; never commit)
+data/raw/*
+data/processed/*
+data/maps/*
+!data/**/.gitkeep
+!data/maps/demo_allowlist.json
+checkpoints/
+runs/
+wandb/
+replays/
+*.npz
+
+# Web
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# SLURM logs
+slurm-*.out
+logs/
+
+# Demo checkpoints shipped with their exact subgraph (scripts/training/bundle_checkpoint.py)
+!data/bundles/**/*.npz
+
+
+# Temporary editor/patch files and incremental build metadata
+*.tmp
+*.bak
+*.orig
+*.rej
+*.tsbuildinfo

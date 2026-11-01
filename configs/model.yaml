@@ -1,0 +1,71 @@
+# Connectome rate network (owner: Person 1). See docs/archive/project/FLY_SABER_HANDOFF.md section 6.
+subgraph_dir: data/processed/malecns_subgraph
+
+# Timing: one game frame at 30 Hz, split into Euler substeps.
+frame_ms: 33.333
+substeps: 4
+tau_init_ms: 20.0
+tau_min_ms: 10.0      # keeps dt / tau < 1 so Euler stays stable
+
+# Resting drive per neuron (trainable bias starts here). Must be positive: photoreceptors
+# inhibit the lamina, so with zero rest the relu clamps everything past the eye to 0.
+bias_init: 0.5
+
+# f(v): relu, softplus, or relu_sat (relu that levels off smoothly at rate_max, like a real
+# neuron's maximum firing rate). Saturation keeps excitatory loops from running away when
+# mood sliders turn gains up; at normal rates (about 0.7) relu_sat is almost exactly relu.
+activation: relu_sat
+rate_max: 10.0
+
+# Each neuron's incoming weights sum to this in absolute value (before trainable scales).
+# Below 1 keeps the untrained network from running away.
+in_weight_scale: 0.9
+
+# Eye luminance (0 to 1) times this is the current into input neurons.
+input_scale: 1.0
+
+# Neuromodulation (the mood system). Modulatory neurons have no synaptic inputs in the model;
+# mood sliders and optogenetics drive them. When one's rate moves by d from its resting rate,
+# each neuron it synapses onto has its output multiplied by exp(gain * d), averaged over that
+# transmitter's inputs to it. At rest d = 0, so an untouched brain is unchanged. Signs are a
+# modeling assumption: octopamine raises gain (arousal; Suver et al. 2012, motion vision in
+# flight), dopamine raises it (arousal and motivation), serotonin lowers it (quiescence).
+modulation_gain:
+  octopamine: 1.0
+  dopamine: 1.0
+  serotonin: -1.0
+modulation_max_log_gain: 1.0   # caps any neuron's modulation at e, about 2.7x
+
+# Gradient checkpointing per brain step: training stores only each frame's neuron states and
+# recomputes the substeps on the backward pass. Without it one BC update needs 169 GB.
+remat: true
+
+# Readout normalization. Untrained, vision moves DN rates by about 0.05%, so a linear
+# readout on raw rates would need weights thousands of times larger than it can reach
+# in a BC run (the first HiPerGator run learned only base rates). Actions instead read
+# (rate - mean) / std per DN, measured once on flickering input when params are created
+# and stored in the params (fixed, not trained), so checkpoints carry them.
+readout_norm: true
+calibration_stimuli: 64   # synthetic songs for fitting the readout (src/training/calibration.py)
+calibration_frames: 90
+readout_std_floor: 0.1
+# Clip normalized values. Episodes start from v = 0, so DNs spend the first ~10 frames far
+# below their mean; unclipped that is |z| up to ~1e5 (loss in the thousands). Normal frames
+# are about +-1.
+readout_clip: 5.0
+
+# Live baseline. The fitted readout reads DN ripples of about 1e-5; with a fixed baseline,
+# brain-param Adam steps of 1e-5 shifted DN rates far more and wrecked it (loss 3.4 -> 97 in
+# ten updates). With live_baseline the readout subtracts the DNs' resting rates under the
+# current params (the brain settled on the gray background for baseline_frames), recomputed
+# every update with gradients, so drift in the brain's operating point cancels.
+live_baseline: true
+baseline_frames: 45
+
+# Train only the readout (stop gradients at the DNs). Off: the live baseline lets the brain
+# itself train.
+freeze_brain: false
+
+# Action heads, from the Fly Saber env (Person 2 contract): per saber, 12 cells + idle
+# and 4 directions + no_cut. Red saber first, then blue.
+action_heads: [13, 5, 13, 5]

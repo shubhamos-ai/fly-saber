@@ -1,0 +1,417 @@
+export interface BrainAsset {
+  schema_version: 1
+  source: string
+  n_neurons: number
+  cell_types: string[]
+  superclasses: string[]
+  roles: string[]
+  sides: string[]
+  nts: string[]
+  position_sources: string[]
+  bounds_um: { min: number[]; max: number[] }
+  body_id: number[]
+  type: number[]
+  superclass: number[]
+  role: number[]
+  side: number[]
+  nt: number[]
+  sign: number[]
+  position_um: number[]
+  position_source: number[]
+}
+
+export interface BrainData {
+  asset: BrainAsset
+  // Null until edges.json loads: the 5.75 MB connection table loads after the neurons.
+  edges: BrainEdges | null
+  groups: Record<string, number[]>
+  positions: Float32Array
+  radius: number
+  distinctPositionCount: number
+}
+
+export interface BrainEdges {
+  schema_version: 1
+  source: string
+  n_neurons: number
+  n_edges: number
+  n_synapses: number
+  body_id: number[]
+  pre: number[]
+  post: number[]
+  // Anatomical synapse counts, not learned model efficacies.
+  weight: number[]
+  sign: number[]
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isFiniteArray(value: unknown, length: number): value is number[] {
+  return Array.isArray(value) && value.length === length && value.every(Number.isFinite)
+}
+
+// Keep array index i unchanged: the backend activity stream and groups use that index.
+export function parseBrainData(raw: unknown, rawGroups: unknown, rawEdges?: unknown): BrainData {
+  if (!isRecord(raw) || raw.schema_version !== 1 || typeof raw.source !== 'string') {
+    throw new Error('Unsupported brain export. Expected neuron schema version 1.')
+  }
+  const count = raw.n_neurons
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 200_000) {
+    throw new Error('Invalid neuron count in the brain export.')
+  }
+  const tables = {
+    type: 'cell_types',
+    superclass: 'superclasses',
+    role: 'roles',
+    side: 'sides',
+    nt: 'nts',
+    position_source: 'position_sources',
+  }
+  for (const [field, lookup] of Object.entries(tables)) {
+    const labels = raw[lookup]
+    const codes = raw[field]
+    if (
+      !Array.isArray(labels) ||
+      !labels.length ||
+      !labels.every((v) => typeof v === 'string') ||
+      !isFiniteArray(codes, count) ||
+      !codes.every((v) => Number.isInteger(v) && v >= 0 && v < labels.length)
+    )
+      throw new Error(`Invalid ${field} metadata in the brain export.`)
+  }
+  if (
+    !isFiniteArray(raw.body_id, count) ||
+    !raw.body_id.every(Number.isSafeInteger) ||
+    !isFiniteArray(raw.sign, count) ||
+    !raw.sign.every((v) => [-1, 0, 1].includes(v)) ||
+    !isFiniteArray(raw.position_um, count * 3)
+  )
+    throw new Error('Invalid neuron IDs or coordinates in the brain export.')
+  if (
+    !isRecord(raw.bounds_um) ||
+    !isFiniteArray(raw.bounds_um.min, 3) ||
+    !isFiniteArray(raw.bounds_um.max, 3)
+  )
+    throw new Error('Invalid coordinate bounds in the brain export.')
+  const { min, max } = raw.bounds_um
+  if (max.some((v, axis) => v < min[axis])) throw new Error('Invalid coordinate bounds.')
+  const extent = Math.max(...max.map((v, axis) => v - min[axis]))
+  if (extent <= 0) throw new Error('The brain export has no spatial extent.')
+  if (!isRecord(rawGroups)) throw new Error('Invalid neuron groups export.')
+  for (const [name, indices] of Object.entries(rawGroups)) {
+    if (
+      !Array.isArray(indices) ||
+      !indices.every((v) => Number.isInteger(v) && v >= 0 && v < count)
+    ) {
+      throw new Error(`Invalid neuron indices in group ${name}.`)
+    }
+  }
+  const asset = raw as unknown as BrainAsset
+  const edges = rawEdges === undefined ? null : parseBrainEdges(rawEdges, asset)
+  const center = min.map((v, axis) => (v + max[axis]) / 2)
+  const scale = 2 / extent
+  const positions = new Float32Array(count * 3)
+  let radius = 0
+  const distinctPositions = new Set<string>()
+  for (let i = 0; i < count; i++) {
+    distinctPositions.add(asset.position_um.slice(i * 3, i * 3 + 3).join(','))
+    const x = (asset.position_um[i * 3] - center[0]) * scale
+    const y = (asset.position_um[i * 3 + 1] - center[1]) * scale
+    const z = (asset.position_um[i * 3 + 2] - center[2]) * scale
+    // Uniform scale and a rigid rotation only: source (x,y,z) -> display (x,-z,y).
+    positions.set([x, -z, y], i * 3)
+    radius = Math.max(radius, Math.hypot(x, y, z))
+  }
+  return {
+    asset,
+    edges,
+    groups: rawGroups as Record<string, number[]>,
+    positions,
+    radius,
+    distinctPositionCount: distinctPositions.size,
+  }
+}
+
+export function parseBrainEdges(raw: unknown, asset: BrainAsset): BrainEdges {
+  if (!isRecord(raw) || raw.schema_version !== 1 || typeof raw.source !== 'string')
+    throw new Error('Unsupported brain connections export. Expected edge schema version 1.')
+  const count = raw.n_edges
+  if (
+    raw.n_neurons !== asset.n_neurons ||
+    !isFiniteArray(raw.body_id, asset.n_neurons) ||
+    !raw.body_id.every((id, i) => id === asset.body_id[i])
+  )
+    throw new Error('Brain connections do not match the neuron ordering.')
+  if (
+    typeof count !== 'number' ||
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    count > 5_000_000 ||
+    !isFiniteArray(raw.pre, count) ||
+    !isFiniteArray(raw.post, count) ||
+    !isFiniteArray(raw.weight, count) ||
+    !isFiniteArray(raw.sign, count)
+  )
+    throw new Error('Invalid connection arrays in the brain export.')
+  let synapses = 0
+  for (let edge = 0; edge < count; edge++) {
+    const pre = raw.pre[edge]
+    const post = raw.post[edge]
+    const weight = raw.weight[edge]
+    if (
+      !Number.isInteger(pre) ||
+      pre < 0 ||
+      pre >= asset.n_neurons ||
+      !Number.isInteger(post) ||
+      post < 0 ||
+      post >= asset.n_neurons ||
+      !Number.isSafeInteger(weight) ||
+      weight < 1 ||
+      raw.sign[edge] !== asset.sign[pre]
+    )
+      throw new Error(`Invalid endpoints, synapse count, or sign for connection ${edge}.`)
+    synapses += weight
+  }
+  if (!Number.isSafeInteger(synapses) || raw.n_synapses !== synapses)
+    throw new Error('Invalid total synapse count in the brain connections export.')
+  return raw as unknown as BrainEdges
+}
+
+export interface ControlSection {
+  group: string
+  label: string
+  description: string
+  n_neurons: number
+}
+export interface MoodControl {
+  name: string
+  label: string
+  /** The modulatory group the mood drives; lesioning it silences the mood. */
+  group?: string
+  low_label: string
+  high_label: string
+  description: string
+  min: number
+  max: number
+}
+/** Several moods set at once; a preset may go past a mood slider's range (within -1..1). */
+export interface MoodPreset {
+  name: string
+  label: string
+  description: string
+  mood: Record<string, number>
+}
+export interface ControlRange {
+  min: number
+  max: number
+}
+export interface Controls {
+  sections: ControlSection[]
+  moods: MoodControl[]
+  presets: MoodPreset[]
+  /** Opto current a user can apply to a section. */
+  stimulation: ControlRange
+  /** Neural noise std, the "jitter" slider. */
+  noise: ControlRange
+}
+
+function isText(value: unknown, ...keys: string[]) {
+  return isRecord(value) && keys.every((key) => typeof value[key] === 'string')
+}
+
+const isRange = (value: unknown): value is ControlRange =>
+  isRecord(value) &&
+  Number.isFinite(value.min) &&
+  Number.isFinite(value.max) &&
+  (value.min as number) <= (value.max as number)
+
+/** The sections, moods, presets and ranges the UI offers (docs/reference/PROTOCOL.md section 4). */
+export function parseControls(raw: unknown): Controls {
+  if (
+    !isRecord(raw) ||
+    raw.schema_version !== 1 ||
+    !Array.isArray(raw.sections) ||
+    !raw.sections.every(
+      (s) => isText(s, 'group', 'label', 'description') && Number.isInteger(s.n_neurons),
+    ) ||
+    !Array.isArray(raw.moods) ||
+    !raw.moods.every(
+      (m) =>
+        isText(m, 'name', 'label', 'low_label', 'high_label', 'description') &&
+        Number.isFinite(m.min) &&
+        Number.isFinite(m.max) &&
+        m.min <= 0 &&
+        m.max >= 0,
+    ) ||
+    !isRange(raw.stimulation) ||
+    !isRange(raw.noise)
+  )
+    throw new Error('Unsupported brain controls. Expected controls schema version 1.')
+  const moods = new Set((raw.moods as MoodControl[]).map((m) => m.name))
+  // Presets are optional in the export; one naming an unknown mood is a bad export.
+  const presets = Array.isArray(raw.presets) ? raw.presets : []
+  if (
+    !presets.every(
+      (p) =>
+        isText(p, 'name', 'label', 'description') &&
+        isRecord(p.mood) &&
+        Object.entries(p.mood).every(
+          ([name, level]) =>
+            moods.has(name) && typeof level === 'number' && level >= -1 && level <= 1,
+        ),
+    )
+  )
+    throw new Error('Unsupported brain controls: a mood preset names an unknown mood.')
+  return {
+    sections: raw.sections,
+    moods: raw.moods,
+    presets,
+    stimulation: { min: raw.stimulation.min, max: raw.stimulation.max },
+    noise: { min: raw.noise.min, max: raw.noise.max },
+  } as Controls
+}
+
+async function fetchJson(file: string, signal: AbortSignal): Promise<unknown> {
+  const response = await fetch(`${import.meta.env.BASE_URL}data/brain/${file}`, { signal })
+  if (!response.ok) throw new Error(`Could not load ${file}.`)
+  return response.json()
+}
+
+// Neurons and groups only, so the 3D view appears before the connection table loads.
+export async function loadBrainData(signal: AbortSignal): Promise<BrainData> {
+  const [asset, groups] = await Promise.all(
+    ['neurons.json', 'groups.json'].map((file) => fetchJson(file, signal)),
+  ).catch((cause: unknown) => {
+    if (signal.aborted) throw cause
+    throw new Error('Could not load the brain data files.')
+  })
+  return parseBrainData(asset, groups)
+}
+
+export async function loadBrainEdges(asset: BrainAsset, signal: AbortSignal): Promise<BrainEdges> {
+  return parseBrainEdges(await fetchJson('edges.json', signal), asset)
+}
+
+// Both endpoints must survive the filters. Selection reveals only incident edges.
+export function filterEdgeIndices(
+  data: BrainData,
+  indices: number[],
+  selected: number | null = null,
+): number[] {
+  if (!data.edges) return []
+  const visible = new Uint8Array(data.asset.n_neurons)
+  for (const index of indices) visible[index] = 1
+  const result: number[] = []
+  const { pre, post, n_edges } = data.edges
+  for (let edge = 0; edge < n_edges; edge++) {
+    if (
+      visible[pre[edge]] &&
+      visible[post[edge]] &&
+      (selected === null || pre[edge] === selected || post[edge] === selected)
+    )
+      result.push(edge)
+  }
+  return result
+}
+
+export function neuronConnectionStats(data: BrainData, index: number) {
+  if (!data.edges) return null
+  let incoming = 0,
+    outgoing = 0,
+    incomingSynapses = 0,
+    outgoingSynapses = 0
+  const { pre, post, weight, n_edges } = data.edges
+  for (let edge = 0; edge < n_edges; edge++) {
+    if (pre[edge] === index) {
+      outgoing++
+      outgoingSynapses += weight[edge]
+    }
+    if (post[edge] === index) {
+      incoming++
+      incomingSynapses += weight[edge]
+    }
+  }
+  return { incoming, outgoing, incomingSynapses, outgoingSynapses }
+}
+
+export interface PartnerType {
+  /** Cell-type index into `asset.cell_types`. */
+  type: number
+  synapses: number
+}
+
+/**
+ * A neuron's strongest partner cell types by synapse count, inputs and outputs, largest
+ * first (spec 5.5's "top inputs and outputs by type"). Null until edges load.
+ */
+export function topPartnerTypes(data: BrainData, index: number, limit = 3) {
+  if (!data.edges) return null
+  const inputs = new Map<number, number>()
+  const outputs = new Map<number, number>()
+  const { pre, post, weight, n_edges } = data.edges
+  const type = data.asset.type
+  for (let edge = 0; edge < n_edges; edge++) {
+    if (post[edge] === index) {
+      const t = type[pre[edge]]
+      inputs.set(t, (inputs.get(t) ?? 0) + weight[edge])
+    }
+    if (pre[edge] === index) {
+      const t = type[post[edge]]
+      outputs.set(t, (outputs.get(t) ?? 0) + weight[edge])
+    }
+  }
+  const top = (totals: Map<number, number>): PartnerType[] =>
+    [...totals]
+      .map(([t, synapses]) => ({ type: t, synapses }))
+      .sort((a, b) => b.synapses - a.synapses || a.type - b.type)
+      .slice(0, limit)
+  return { inputs: top(inputs), outputs: top(outputs) }
+}
+
+/** What a cell type is known to do, written by hand (configs/cell_types.yaml). */
+export interface CellTypeDescription {
+  name: string
+  types: string[]
+  description: string
+}
+
+/** explorer.json as a lookup from cell-type name to its description. */
+export function parseExplorer(raw: unknown): Map<string, CellTypeDescription> {
+  if (
+    !isRecord(raw) ||
+    raw.schema_version !== 1 ||
+    !Array.isArray(raw.descriptions) ||
+    !raw.descriptions.every(
+      (d) =>
+        isText(d, 'name', 'description') &&
+        Array.isArray(d.types) &&
+        d.types.every((t: unknown) => typeof t === 'string'),
+    )
+  )
+    throw new Error('Unsupported Brain Explorer data. Expected explorer schema version 1.')
+  const byType = new Map<string, CellTypeDescription>()
+  for (const entry of raw.descriptions as CellTypeDescription[])
+    for (const type of entry.types) byType.set(type, entry)
+  return byType
+}
+
+export async function loadExplorer(signal: AbortSignal) {
+  return parseExplorer(await fetchJson('explorer.json', signal))
+}
+
+export function filterNeuronIndices(data: BrainData, group: string, cellType: string): number[] {
+  const indices = group
+    ? (data.groups[group] ?? [])
+    : Array.from({ length: data.asset.n_neurons }, (_, i) => i)
+  return indices.filter((i) => cellType === '' || data.asset.type[i] === Number(cellType))
+}
+
+export function cellTypeColor(type: number): string {
+  return `hsl(${(type * 137.508 + 165) % 360}, 58%, 40%)`
+}
+
+export async function loadControls(signal: AbortSignal): Promise<Controls> {
+  return parseControls(await fetchJson('controls.json', signal))
+}
